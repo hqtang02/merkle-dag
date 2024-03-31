@@ -5,7 +5,16 @@ import (
 	"hash"
 )
 
-const BlobSize = 262144
+const (
+	LIST_LIMIT  = 2048
+	BLOCK_LIMIT = 256 * 1024
+)
+
+const (
+	BLOB = "blob"
+	LIST = "list"
+	TREE = "tree"
+)
 
 type Link struct {
 	Name string
@@ -18,31 +27,132 @@ type Object struct {
 	Data  []byte
 }
 
-func Add(store KVStore, node Node, h hash.Hash) []byte {
-
-	if node.Type() == FILE {
-		file := node.(File)
-		fileSlice := addBlock(file.Bytes(), store, h)
-		jsonData, _ := json.Marshal(fileSlice)
+func dfsForSlice(hight int, node File, store KVStore, seedId int, h hash.Hash) (*Object, int) {
+	if hight == 1 {
+		if (len(node.Bytes()) - seedId) <= 256*1024 {
+			data := node.Bytes()[seedId:]
+			blob := Object{
+				Links: nil,
+				Data:  data,
+			}
+			jsonData, _ := json.Marshal(blob)
+			h.Reset()
+			h.Write(jsonData)
+			exists, _ := store.Has(h.Sum(nil))
+			if !exists {
+				store.Put(h.Sum(nil), data)
+			}
+			return &blob, len(data)
+		}
+		links := &Object{}
+		totalLen := 0
+		for i := 1; i <= 4096; i++ {
+			end := seedId + 256*1024
+			if len(node.Bytes()) < end {
+				end = len(node.Bytes())
+			}
+			data := node.Bytes()[seedId:end]
+			blob := Object{
+				Links: nil,
+				Data:  data,
+			}
+			totalLen += len(data)
+			jsonData, _ := json.Marshal(blob)
+			h.Reset()
+			h.Write(jsonData)
+			exists, _ := store.Has(h.Sum(nil))
+			if !exists {
+				store.Put(h.Sum(nil), data)
+			}
+			links.Links = append(links.Links, Link{
+				Hash: h.Sum(nil),
+				Size: len(data),
+			})
+			links.Data = append(links.Data, []byte("data")...)
+			seedId += 256 * 1024
+			if seedId >= len(node.Bytes()) {
+				break
+			}
+		}
+		jsonData, _ := json.Marshal(links)
+		h.Reset()
 		h.Write(jsonData)
-		return h.Sum(nil)
+		exists, _ := store.Has(h.Sum(nil))
+		if !exists {
+			store.Put(h.Sum(nil), jsonData)
+		}
+		return links, totalLen
 	} else {
-		dir := node.(Dir)
-		dirSlice := addDir(dir, store, h)
-		jsonData, _ := json.Marshal(dirSlice)
+		links := &Object{}
+		totalLen := 0
+		for i := 1; i <= 4096; i++ {
+			if seedId >= len(node.Bytes()) {
+				break
+			}
+			child, childLen := dfsForSlice(hight-1, node, store, seedId, h)
+			totalLen += childLen
+			jsonData, _ := json.Marshal(child)
+			h.Reset()
+			h.Write(jsonData)
+			links.Links = append(links.Links, Link{
+				Hash: h.Sum(nil),
+				Size: childLen,
+			})
+			typeName := "link"
+			if child.Links == nil {
+				typeName = "data"
+			}
+			links.Data = append(links.Data, []byte(typeName)...)
+		}
+		jsonData, _ := json.Marshal(links)
+		h.Reset()
 		h.Write(jsonData)
-		return h.Sum(nil)
+		exists, _ := store.Has(h.Sum(nil))
+		if !exists {
+			store.Put(h.Sum(nil), jsonData)
+		}
+		return links, totalLen
 	}
 }
 
-func addDir(store KVStore, node Dir, h hash.Hash) *Object {
+func sliceFile(node File, store KVStore, h hash.Hash) *Object {
+	if len(node.Bytes()) <= 256*1024 {
+		data := node.Bytes()
+		blob := Object{
+			Links: nil,
+			Data:  data,
+		}
+		jsonData, _ := json.Marshal(blob)
+		h.Reset()
+		h.Write(jsonData)
+		exists, _ := store.Has(h.Sum(nil))
+		if !exists {
+			store.Put(h.Sum(nil), data)
+		}
+		return &blob
+	}
+	linkLen := (len(node.Bytes()) + (256*1024 - 1)) / (256 * 1024)
+	hight := 0
+	tmp := linkLen
+	for {
+		hight++
+		tmp /= 4096
+		if tmp == 0 {
+			break
+		}
+	}
+	res, _ := dfsForSlice(hight, node, store, 0, h)
+	return res
+}
+
+func sliceDirectory(node Dir, store KVStore, h hash.Hash) *Object {
 	iter := node.It()
 	tree := &Object{}
 	for iter.Next() {
 		elem := iter.Node()
 		if elem.Type() == FILE {
 			file := elem.(File)
-			fileSlice := addBlock(file.Bytes(), store, h)
+			fileSlice := sliceFile(file, store, h)
 			jsonData, _ := json.Marshal(fileSlice)
 			h.Reset()
 			h.Write(jsonData)
@@ -58,7 +168,7 @@ func addDir(store KVStore, node Dir, h hash.Hash) *Object {
 			tree.Data = append(tree.Data, []byte(elemType)...)
 		} else {
 			dir := elem.(Dir)
-			dirSlice := addDir(dir, store, h)
+			dirSlice := sliceDirectory(dir, store, h)
 			jsonData, _ := json.Marshal(dirSlice)
 			h.Reset()
 			h.Write(jsonData)
@@ -81,65 +191,19 @@ func addDir(store KVStore, node Dir, h hash.Hash) *Object {
 	return tree
 }
 
-func addBlock(data []byte, store KVStore, h hash.Hash) Object {
-	slips := ChunkData(data, BlobSize)
-	var links []Link
-	var Size = 0
-	for i := range slips {
-		_, blobHash := addSingleBlob(slips[i], store, h)
-		links = append(links, Link{
-			Name: string(blobHash),
-			Hash: blobHash,
-			Size: len(slips[i]),
-		})
-		Size += len(slips[i])
+func Add(store KVStore, node Node, h hash.Hash) []byte {
+	// 将分片写入KVStore，并返回Merkle Root
+	if node.Type() == FILE {
+		file := node.(File)
+		fileSlice := sliceFile(file, store, h)
+		jsonData, _ := json.Marshal(fileSlice)
+		h.Write(jsonData)
+		return h.Sum(nil)
+	} else {
+		dir := node.(Dir)
+		dirSlice := sliceDirectory(dir, store, h)
+		jsonData, _ := json.Marshal(dirSlice)
+		h.Write(jsonData)
+		return h.Sum(nil)
 	}
-	res := Object{
-		Links: links,
-		Data:  nil,
-	}
-	marshal, err := json.Marshal(res)
-	if err != nil {
-		return Object{nil, nil}
-	}
-	has := h.Sum(marshal)
-	ifhave, err := store.Has(has)
-	if err != nil {
-		return Object{}
-	}
-	if !ifhave {
-		store.Put(has, marshal)
-	}
-	return res
-}
-
-// ChunkData 分片
-func ChunkData(data []byte, chunkSize int) [][]byte {
-	var chunks [][]byte
-
-	for i := 0; i < len(data); i += chunkSize {
-		end := i + chunkSize
-		if end > len(data) {
-			end = len(data)
-		}
-		chunk := data[i:end]
-		chunks = append(chunks, chunk)
-	}
-
-	return chunks
-}
-
-func addSingleBlob(data []byte, store KVStore, h hash.Hash) (Object, []byte) {
-	bytes := h.Sum(data)
-	has, err := store.Has(bytes)
-	if err != nil {
-		return Object{}, nil
-	}
-	if !has {
-		err := store.Put(bytes, data)
-		if err != nil {
-			return Object{}, nil
-		}
-	}
-	return Object{Data: data}, bytes
 }
